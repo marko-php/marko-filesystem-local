@@ -391,7 +391,15 @@ readonly class LocalFilesystem implements FilesystemInterface
     public function deleteDirectory(
         string $path,
     ): bool {
+        if ($this->validatePath($path) === '') {
+            throw PathException::rootDeletion($path);
+        }
+
         $fullPath = $this->fullPath($path);
+
+        if (is_link($fullPath)) {
+            return unlink($fullPath);
+        }
 
         if (!is_dir($fullPath)) {
             return true;
@@ -436,19 +444,30 @@ readonly class LocalFilesystem implements FilesystemInterface
     }
 
     /**
+     * Normalize a disk-relative path, dropping empty and '.' segments.
+     *
+     * Returns '' when the path refers to the disk root.
+     *
      * @throws PathException
      */
     private function validatePath(
         string $path,
     ): string {
-        $normalized = str_replace('\\', '/', $path);
-        $normalized = ltrim($normalized, '/');
+        $segments = [];
 
-        if (str_contains($normalized, '../') || str_contains($normalized, '..\\') || $normalized === '..') {
-            throw PathException::traversalAttempt($path);
+        foreach (explode('/', str_replace('\\', '/', $path)) as $segment) {
+            if ($segment === '' || $segment === '.') {
+                continue;
+            }
+
+            if ($segment === '..') {
+                throw PathException::traversalAttempt($path);
+            }
+
+            $segments[] = $segment;
         }
 
-        return $normalized;
+        return implode('/', $segments);
     }
 
     /**
@@ -458,12 +477,47 @@ readonly class LocalFilesystem implements FilesystemInterface
         string $path,
     ): string {
         $normalized = $this->validatePath($path);
+        $fullPath = $normalized === '' ? $this->basePath : $this->basePath . '/' . $normalized;
 
-        if ($normalized === '' || $normalized === '.') {
-            return $this->basePath;
+        $this->assertWithinRoot($fullPath, $path);
+
+        return $fullPath;
+    }
+
+    /**
+     * Resolve symbolic links and ensure the path stays inside the disk root.
+     *
+     * The deepest existing ancestor is resolved, so paths that do not exist
+     * yet (e.g. write targets) are confined by the directory they would be
+     * created in.
+     *
+     * @throws PathException
+     */
+    private function assertWithinRoot(
+        string $fullPath,
+        string $path,
+    ): void {
+        $root = realpath($this->basePath);
+
+        if ($root === false) {
+            return;
         }
 
-        return $this->basePath . '/' . $normalized;
+        $probe = $fullPath;
+        $resolved = realpath($probe);
+
+        while ($resolved === false && $probe !== $this->basePath) {
+            $probe = dirname($probe);
+            $resolved = realpath($probe);
+        }
+
+        if ($resolved === false) {
+            return;
+        }
+
+        if ($resolved !== $root && !str_starts_with($resolved, rtrim($root, '/') . '/')) {
+            throw PathException::outsideRoot($path);
+        }
     }
 
     /**
@@ -529,7 +583,9 @@ readonly class LocalFilesystem implements FilesystemInterface
 
             $path = $directory . '/' . $item;
 
-            if (is_dir($path)) {
+            if (is_link($path)) {
+                unlink($path);
+            } elseif (is_dir($path)) {
                 $this->deleteDirectoryRecursively($path);
             } else {
                 unlink($path);

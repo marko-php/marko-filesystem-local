@@ -34,7 +34,7 @@ function cleanupTestPath(
 
         $itemPath = $path . '/' . $item;
 
-        if (is_dir($itemPath)) {
+        if (is_dir($itemPath) && !is_link($itemPath)) {
             cleanupTestPath($itemPath);
         } else {
             unlink($itemPath);
@@ -297,6 +297,132 @@ it('deletes directory with contents', function () {
 
     expect(is_dir($this->basePath . '/full'))->toBeFalse();
 });
+
+it('removes a symlinked directory as a link without deleting the outside target contents', function () {
+    $outside = getTestBasePath();
+    mkdir($outside . '/victim', 0755, true);
+    file_put_contents($outside . '/victim/secret.txt', 'secret');
+
+    mkdir($this->basePath . '/dir');
+    file_put_contents($this->basePath . '/dir/file.txt', 'content');
+    symlink($outside . '/victim', $this->basePath . '/dir/link');
+
+    try {
+        $this->filesystem->deleteDirectory('dir');
+
+        expect(is_dir($this->basePath . '/dir'))->toBeFalse()
+            ->and(is_link($this->basePath . '/dir/link'))->toBeFalse()
+            ->and(file_get_contents($outside . '/victim/secret.txt'))->toBe('secret');
+    } finally {
+        cleanupTestPath($outside);
+    }
+});
+
+it('removes a directory symlink passed directly as a link without recursing into the target', function () {
+    $outside = getTestBasePath();
+    mkdir($outside, 0755, true);
+    file_put_contents($outside . '/secret.txt', 'secret');
+
+    try {
+        mkdir($this->basePath . '/inner');
+        file_put_contents($this->basePath . '/inner/keep.txt', 'keep');
+        symlink($this->basePath . '/inner', $this->basePath . '/link');
+
+        $this->filesystem->deleteDirectory('link');
+
+        expect(is_link($this->basePath . '/link'))->toBeFalse()
+            ->and(file_get_contents($this->basePath . '/inner/keep.txt'))->toBe('keep')
+            ->and(file_get_contents($outside . '/secret.txt'))->toBe('secret');
+    } finally {
+        cleanupTestPath($outside);
+    }
+});
+
+it('refuses to delete the disk root', function (string $path) {
+    file_put_contents($this->basePath . '/keep.txt', 'keep');
+
+    try {
+        $this->filesystem->deleteDirectory($path);
+        $this->fail("deleteDirectory('$path') should have thrown");
+    } catch (PathException) {
+        expect(file_get_contents($this->basePath . '/keep.txt'))->toBe('keep')
+            ->and(is_dir($this->basePath))->toBeTrue();
+    }
+})->with(['', '/', '.', './', 'x/..', 'x/../', '/./.']);
+
+it('refuses to read through a symlink that resolves outside the disk root', function () {
+    $outside = getTestBasePath();
+    mkdir($outside, 0755, true);
+    file_put_contents($outside . '/secret.txt', 'secret');
+    symlink($outside . '/secret.txt', $this->basePath . '/leak.txt');
+
+    try {
+        expect(fn () => $this->filesystem->read('leak.txt'))->toThrow(PathException::class);
+    } finally {
+        cleanupTestPath($outside);
+    }
+});
+
+it('refuses to write into a symlinked directory that resolves outside the disk root', function () {
+    $outside = getTestBasePath();
+    mkdir($outside, 0755, true);
+    symlink($outside, $this->basePath . '/escape');
+
+    try {
+        expect(fn () => $this->filesystem->write('escape/new/file.txt', 'pwned'))->toThrow(PathException::class)
+            ->and(file_exists($outside . '/new/file.txt'))->toBeFalse();
+    } finally {
+        cleanupTestPath($outside);
+    }
+});
+
+it('refuses to copy or move into a symlinked directory that resolves outside the disk root', function () {
+    $outside = getTestBasePath();
+    mkdir($outside, 0755, true);
+    symlink($outside, $this->basePath . '/escape');
+    file_put_contents($this->basePath . '/file.txt', 'content');
+
+    try {
+        expect(fn () => $this->filesystem->copy('file.txt', 'escape/copy.txt'))->toThrow(PathException::class)
+            ->and(fn () => $this->filesystem->move('file.txt', 'escape/moved.txt'))->toThrow(PathException::class)
+            ->and(file_exists($outside . '/copy.txt'))->toBeFalse()
+            ->and(file_exists($outside . '/moved.txt'))->toBeFalse();
+    } finally {
+        cleanupTestPath($outside);
+    }
+});
+
+it('writes to new nested paths inside a disk root that is itself a symlink', function () {
+    $link = getTestBasePath();
+    symlink($this->basePath, $link);
+
+    try {
+        $filesystem = new LocalFilesystem($link);
+        $filesystem->write('a/b/c.txt', 'content');
+
+        expect(file_get_contents($this->basePath . '/a/b/c.txt'))->toBe('content')
+            ->and($filesystem->read('a/b/c.txt'))->toBe('content');
+    } finally {
+        unlink($link);
+    }
+});
+
+it('writes when the disk root does not exist yet', function () {
+    $root = getTestBasePath();
+    $filesystem = new LocalFilesystem($root);
+
+    try {
+        $filesystem->write('nested/file.txt', 'content');
+
+        expect(file_get_contents($root . '/nested/file.txt'))->toBe('content');
+    } finally {
+        cleanupTestPath($root);
+    }
+});
+
+it('prevents path traversal with a trailing parent segment', function () {
+    $this->filesystem->read('subdir/..');
+})->throws(PathException::class);
 
 // visibility tests
 it('sets public visibility', function () {
